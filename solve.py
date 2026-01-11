@@ -1,146 +1,180 @@
-import socket
+import struct
+import json
 import re
-import math
+import zlib
+import sys
+from pathlib import Path
 
-HOST = "72.62.122.169"   
-PORT = 8302
-ROUNDS = 3               
+PCAP = sys.argv[1] if len(sys.argv) > 1 else "traffics.pcapng"
 
-# PARAMETER
-p = 87975800266411715571738368366335380369666653297323309778888046169239182316403
-a = 24706251795871763793703712664815408269526601526653607864558628275826577881713
-b = 23420866761033089903868195361764762487999201284344109943038351939994211111267
+def rc4_crypt(key: bytes, data: bytes) -> bytes:
+    S = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + S[i] + key[i % len(key)]) & 0xFF
+        S[i], S[j] = S[j], S[i]
+    i = j = 0
+    out = bytearray()
+    for b in data:
+        i = (i + 1) & 0xFF
+        j = (j + S[i]) & 0xFF
+        S[i], S[j] = S[j], S[i]
+        k = S[(S[i] + S[j]) & 0xFF]
+        out.append(b ^ k)
+    return bytes(out)
 
-m = p >> 202
+def parse_pcapng(buf: bytes):
+    off = 0
+    endian = "<"
+    interfaces = []
+    packets = []
 
-# Sage 
-N = 87975800266411715571738368366335380369976192431834769153921751523575374324650
+    while off + 12 <= len(buf):
+        btype = struct.unpack_from(endian + "I", buf, off)[0]
+        blen  = struct.unpack_from(endian + "I", buf, off + 4)[0]
 
-g = math.gcd(N, m)
-q = N // g
+        # sanity + fallback endian
+        if blen < 12 or off + blen > len(buf):
+            other = ">" if endian == "<" else "<"
+            btype2 = struct.unpack_from(other + "I", buf, off)[0]
+            blen2  = struct.unpack_from(other + "I", buf, off + 4)[0]
+            if blen2 >= 12 and off + blen2 <= len(buf):
+                btype, blen = btype2, blen2
+                endian = other
+            else:
+                break
 
-#  ECC 
-class Point:
-    __slots__ = ("x", "y", "inf")
-    def __init__(self, x=None, y=None, inf=False):
-        self.x = x
-        self.y = y
-        self.inf = inf
+        body = buf[off + 8 : off + blen - 4]
 
-O = Point(inf=True)
+        # Section Header Block
+        if btype == 0x0A0D0D0A and len(body) >= 8:
+            bom = body[:4]
+            if bom == b"\x4d\x3c\x2b\x1a":
+                endian = "<"
+            elif bom == b"\x1a\x2b\x3c\x4d":
+                endian = ">"
 
-def add(P: Point, Q: Point) -> Point:
-    if P.inf:
-        return Q
-    if Q.inf:
-        return P
+        # Interface Description Block
+        elif btype == 0x00000001 and len(body) >= 8:
+            linktype = struct.unpack_from(endian + "H", body, 0)[0]
+            snaplen  = struct.unpack_from(endian + "I", body, 4)[0]
+            interfaces.append((linktype, snaplen))
 
-    if P.x == Q.x:
-        if (P.y + Q.y) % p == 0:
-            return O
-        # doubling
-        den = (2 * P.y) % p
-        if den == 0:
-            return O
-        lam = ((3 * P.x * P.x + a) * pow(den, -1, p)) % p
-    else:
-        den = (Q.x - P.x) % p
-        if den == 0:
-            return O
-        lam = ((Q.y - P.y) * pow(den, -1, p)) % p
+        # Enhanced Packet Block
+        elif btype == 0x00000006 and len(body) >= 20:
+            iface_id, tsh, tsl, caplen, origlen = struct.unpack_from(endian + "IIIII", body, 0)
+            pkt = body[20 : 20 + caplen]
+            packets.append((iface_id, pkt))
 
-    xr = (lam * lam - P.x - Q.x) % p
-    yr = (lam * (P.x - xr) - P.y) % p
-    return Point(xr, yr)
+        off += blen
 
-def mul(k: int, P: Point) -> Point:
-    R = O
-    Q = P
-    while k > 0:
-        if k & 1:
-            R = add(R, Q)
-        Q = add(Q, Q)
-        k >>= 1
-    return R
+    return interfaces, packets
 
-# ===== NETWORK =====
-def recvuntil(sock: socket.socket, token: bytes) -> bytes:
-    data = b""
-    while token not in data:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    return data
+def parse_ipv4(payload: bytes):
+    if len(payload) < 20:
+        return None
+    vihl = payload[0]
+    ver = vihl >> 4
+    ihl = (vihl & 0x0F) * 4
+    if ver != 4 or len(payload) < ihl:
+        return None
+    total_len = struct.unpack("!H", payload[2:4])[0]
+    proto = payload[9]
+    src = payload[12:16]
+    dst = payload[16:20]
+    l4 = payload[ihl:total_len]
+    return proto, src, dst, l4
 
-def recvline(sock: socket.socket) -> bytes:
-    data = b""
-    while not data.endswith(b"\n"):
-        ch = sock.recv(1)
-        if not ch:
-            break
-        data += ch
-    return data
+def parse_cart_from_payload(payload: bytes):
+    start = payload.find(b"CART")
+    if start == -1:
+        return None
+    blob = payload[start:]
+    trac = blob.rfind(b"TRAC")
+    if trac == -1:
+        return None
+    blob = blob[:trac + 28]  # include 28-byte footer
 
-pt_re = re.compile(r"^\((\d+),\s*(\d+)\)\s*$")
+    # Mandatory header: 4s h Q 16s Q  (little-endian)
+    if blob[:4] != b"CART":
+        return None
+    version = struct.unpack_from("<h", blob, 4)[0]
+    reserved = struct.unpack_from("<Q", blob, 6)[0]
+    key = blob[14:30]
+    opt_header_len = struct.unpack_from("<Q", blob, 30)[0]
 
-def get_bits_once():
-    with socket.create_connection((HOST, PORT)) as s:
-        recvuntil(s, b"> ")
-        s.sendall(b"1\n")
+    off = 38
+    opt_header_enc = blob[off:off + opt_header_len]
+    off += opt_header_len
 
-        header = recvline(s).decode(errors="ignore").strip()
-        m1 = re.search(r"Printing\s+(\d+)\s+lines", header)
-        if not m1:
-            raise RuntimeError("Gagal parse header: " + header)
-        L = int(m1.group(1))
+    # Mandatory footer (28 bytes): 4s Q Q Q  (di chall ini: reserved, filelen, opt_footer_len)
+    footer = blob[-28:]
+    if footer[:4] != b"TRAC":
+        return None
+    opt_footer_len = struct.unpack_from("<Q", footer, 20)[0]
 
-        bits = []
-        for _ in range(L):
-            line = recvline(s).decode(errors="ignore").strip()
-            mm = pt_re.match(line)
-            if not mm:
-                raise RuntimeError("Gagal parse point: " + line)
-            x = int(mm.group(1))
-            y = int(mm.group(2))
-            P = Point(x, y)
+    opt_footer_enc = blob[-28 - opt_footer_len:-28] if opt_footer_len else b""
+    data_enc = blob[off:len(blob) - 28 - opt_footer_len]
 
-            # membership test: q * P == O  <=>  P in mE  (bit kemungkinan 0)
-            T = mul(q, P)
-            bits.append(0 if T.inf else 1)
+    return key, opt_header_enc, data_enc
 
-        return bits
+def extract_char_from_py(code: bytes) -> str:
+    s = code.decode("utf-8", errors="ignore")
+    m = re.search(r"(\w+)\s*=\s*(\w+)\s*\^\s*(\w+)", s)
+    if not m:
+        return "?"
+    a, b = m.group(2), m.group(3)
+    ma = re.search(rf"^{re.escape(a)}\s*=\s*(\d+)\s*$", s, re.M)
+    mb = re.search(rf"^{re.escape(b)}\s*=\s*(\d+)\s*$", s, re.M)
+    if not (ma and mb):
+        return "?"
+    return chr(int(ma.group(1)) ^ int(mb.group(1)))
 
 def main():
-    print("[i] m =", m)
-    print("[i] N =", N)
-    print("[i] gcd(N,m) =", g)
-    print("[i] q =", q)
-    print("[i] rounds =", ROUNDS)
+    buf = Path(PCAP).read_bytes()
+    interfaces, pkts = parse_pcapng(buf)
 
-    final_bits = None
+    # ambil UDP dst port 9890 (Ethernet linktype=1)
+    extracted = {}
+    for iface_id, frame in pkts:
+        if len(frame) < 14:
+            continue
+        eth_type = struct.unpack("!H", frame[12:14])[0]
+        if eth_type != 0x0800:  # IPv4
+            continue
 
-    for r in range(ROUNDS):
-        bits = get_bits_once()
-        print(f"[i] got {len(bits)} bits from round {r+1}")
+        ip = parse_ipv4(frame[14:])
+        if not ip:
+            continue
+        proto, _src, _dst, l4 = ip
+        if proto != 17 or len(l4) < 8:  # UDP
+            continue
 
-        if final_bits is None:
-            final_bits = bits[:]   # copy
-        else:
-            # OR per-bit biar 1 yang ke-skip ketangkep di round lain
-            final_bits = [fb | b for fb, b in zip(final_bits, bits)]
+        sport, dport, ulen, _csum = struct.unpack("!HHHH", l4[:8])
+        if dport != 9890:
+            continue
+        payload = l4[8:ulen]
 
-    # reconstruct integer (LSB-first)
-    flag_int = 0
-    for i, bit in enumerate(final_bits):
-        if bit:
-            flag_int |= (1 << i)
+        cart = parse_cart_from_payload(payload)
+        if not cart:
+            continue
+        key, opt_header_enc, data_enc = cart
 
-    blen = (len(final_bits) + 7) // 8
-    flag_bytes = flag_int.to_bytes(blen, "big")
-    inside = flag_bytes.decode("ascii", errors="strict")  # harusnya udah clean
+        header_plain = rc4_crypt(key, opt_header_enc)
+        header_json = json.loads(header_plain.decode("utf-8", errors="ignore"))
+        name = header_json.get("name", "unknown.bin")
 
-    print("\nFLAG =", f"NETCOMP{{{inside}}}")
+        compressed = rc4_crypt(key, data_enc)
+        raw = zlib.decompress(compressed)
+        extracted[name] = raw
+
+    # susun 000.py..083.py jadi message
+    chars = []
+    for i in range(84):
+        fn = f"{i:03d}.py"
+        chars.append(extract_char_from_py(extracted[fn]))
+    msg = "".join(chars)  # sudah termasuk {...}
+    print("NETCOMP" + msg)
 
 if __name__ == "__main__":
     main()
